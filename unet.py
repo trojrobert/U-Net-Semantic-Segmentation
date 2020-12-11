@@ -1,8 +1,16 @@
+import itertools
+import numpy as np
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 
+import seg_data
+import seg_transforms_cv
+import seg_transforms
+
+from torchvision import transforms    
+import matplotlib.pyplot as plt
 
 class input_conv(nn.Module):
     def __init__(self, in_c, out_c):
@@ -198,6 +206,7 @@ def experiment(job_desc, dataset, model, arch, freeze_bn,
                n_sup, n_unsup, n_val, split_seed, split_path, val_seed, save_preds, save_model, num_workers):
     params = locals().copy()
 
+    # set mask mode
     if mask_mode == 'zero':
         mask_mix = False
     elif mask_mode == 'mix':
@@ -205,7 +214,8 @@ def experiment(job_desc, dataset, model, arch, freeze_bn,
     else:
         raise ValueError('Unknown mask_mode {}'.format(mask_mode))
     del mask_mode
-
+    
+    # get the paths ans indexes to images and labels 
     ds_dict = datasets.load_dataset(dataset, n_val, val_seed, n_sup, n_unsup, split_seed, split_path)
     
     ds_src = ds_dict['ds_src']
@@ -234,9 +244,23 @@ def experiment(job_desc, dataset, model, arch, freeze_bn,
                                                prop_by_area=not boxmask_by_size, within_bounds=not boxmask_outside_bounds,
                                                invert=not boxmask_no_invert)
 
+
+    train_transforms = []
+    eval_transforms = []
+
+    NET_MEAN =  np.array([0.485, 0.456, 0.406])
+    NET_STD = np.array([0.229, 0.224, 0.225])
+   
+    train_transforms.append(seg_transforms_cv.SegCVTransformNormalizeToTensor(NET_MEAN, NET_STD))
+
+
+
     train_sup_ds = ds_src.dataset(labels=True, mask=False, xf=False, pair=False,
+                                    transforms=seg_transforms.SegTransformCompose(train_transforms),
                                     pipeline_type='cv')
-    train_unsup_ds = ds_src.dataset(labels=False, mask=True, xf=False, pair=False, pipeline_type='cv')
+    train_unsup_ds = ds_src.dataset(labels=False, mask=True, xf=False, pair=False,
+                                    transforms=seg_transforms.SegTransformCompose(train_transforms),
+                                     pipeline_type='cv')
 
 
     add_mask_params_to_batch = mask_gen.AddMaskParamsToBatch(
@@ -247,6 +271,7 @@ def experiment(job_desc, dataset, model, arch, freeze_bn,
     collate_fn = seg_data.SegCollate(BLOCK_SIZE)
     mask_collate_fn = seg_data.SegCollate(BLOCK_SIZE, batch_aug_fn=add_mask_params_to_batch)
 
+    sup_sampler = seg_data.RepeatSampler(torch.utils.data.SubsetRandomSampler(sup_ndx))
     train_sup_loader = torch.utils.data.DataLoader(train_sup_ds, batch_size, sampler=sup_sampler,
                                                    collate_fn=collate_fn, num_workers=num_workers)
     if cons_weight > 0.0:
@@ -261,6 +286,81 @@ def experiment(job_desc, dataset, model, arch, freeze_bn,
     else:
         train_unsup_loader_0 = None
         train_unsup_loader_1 = None
+
+    # Report dataset size
+    print('Dataset:')
+    print('len(sup_ndx)={}'.format(len(sup_ndx)))
+    print('len(unsup_ndx)={}'.format(len(unsup_ndx)))
+    if ds_src is not ds_tgt:
+        print('len(src_val_ndx)={}'.format(len(tgt_val_ndx)))
+        print('len(tgt_val_ndx)={}'.format(len(tgt_val_ndx)))
+    else:
+        print('len(val_ndx)={}'.format(len(tgt_val_ndx)))
+    if test_ndx is not None:
+        print('len(test_ndx)={}'.format(len(test_ndx)))
+
+    if n_sup != -1:
+        print('sup_ndx={}'.format(sup_ndx.tolist()))
+
+    
+    # Create iterators
+    train_sup_iter = iter(train_sup_loader)
+    train_unsup_iter_0 = iter(train_unsup_loader_0) if train_unsup_loader_0 is not None else None
+    train_unsup_iter_1 = iter(train_unsup_loader_1) if train_unsup_loader_1 is not None else None
+    iters_per_epoch = 10
+
+    for sup_batch in itertools.islice(train_sup_iter, iters_per_epoch):
+            #
+            # Supervised branch
+            #
+
+            batch_x = sup_batch['image']
+            batch_y = sup_batch['labels']
+
+
+            if cons_weight > 0.0:
+                for n_ in range(unsup_batch_ratio):
+                    #
+                    # Unsupervised branch
+                    #
+
+                    if mask_mix:
+                        # Mix mode: batch consists of paired unsupervised samples and mask parameters
+                        unsup_batch0 = next(train_unsup_iter_0)
+                        unsup_batch1 = next(train_unsup_iter_1)
+                        batch_ux0 = unsup_batch0['image']
+                        batch_um0 = unsup_batch0['mask']
+
+                        batch_ux1 = unsup_batch1['image']
+                        batch_um1 = unsup_batch1['mask']
+                        batch_mask_params = unsup_batch0['mask_params']
+
+                        #print(batch_ux0.__dict__)
+
+                    if n_ == 1:
+                        z = batch_ux1[0] * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                        z = z + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+
+                        trans = transforms.ToPILImage(mode='RGB')(z)
+                        plt.imshow(trans)
+                        plt.savefig("mygraph.png")
+
+
+
+    
+    #normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    # from torchvision import transforms    
+    # import matplotlib.pyplot as plt
+
+    z = batch_y[0] * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    z = z + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+
+    trans = transforms.ToPILImage(mode='RGB')(z)
+    plt.imshow(trans)
+    plt.savefig("mygraph.png")
+    
+
 
 
 if __name__ == "__main__":
